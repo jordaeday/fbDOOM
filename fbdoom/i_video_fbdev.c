@@ -40,6 +40,7 @@ rcsid[] = "$Id: i_x.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include <stdarg.h>
 #include <sys/time.h>
@@ -158,9 +159,21 @@ void cmap_to_fb(uint8_t * out, uint8_t * in, int in_pixels)
     }
 }
 
+static void screenshot_handler(int sig)
+{
+    (void)sig;
+    if (I_VideoBuffer_FB == NULL) return;
+    int fd = open("/tmp/doom_screenshot.raw", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    write(fd, I_VideoBuffer_FB, fb.xres * fb.yres * (fb.bits_per_pixel / 8));
+    close(fd);
+}
+
 void I_InitGraphics (void)
 {
     int i;
+
+    signal(SIGUSR1, screenshot_handler);
 
     /* Open fbdev file descriptor */
     fd_fb = open("/dev/fb0", O_RDWR);

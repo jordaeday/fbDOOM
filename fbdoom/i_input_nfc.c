@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <libserialport.h>
-#include <assert.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 #include "config.h"
 #include "deh_str.h"
 #include "doomtype.h"
@@ -32,7 +34,7 @@ typedef struct {
   uint8_t crc;
 } ipp_header;
 
-
+#define HEADER_LENGTH 7
 
 typedef struct {
   char tag_id[7];
@@ -41,28 +43,25 @@ typedef struct {
 } tag_info;
 
 tag_info all_tags[] = {
-  { .tag_id = { 0x04, 0x04, 0xcb, 0x65, 0x5f, 0x61, 0x80 }, .doom_keycode = KEY_UPARROW },
-  { .tag_id = { 0x04, 0x51, 0xcd, 0x65, 0x5f, 0x61, 0x80 }, .doom_keycode = KEY_DOWNARROW },
-  { .tag_id = { 0x04, 0x5c, 0xbe, 0x54, 0x6f, 0x61, 0x81 }, .doom_keycode = KEY_LEFTARROW },
-  { .tag_id = { 0x04, 0x79, 0x03, 0x54, 0x6F, 0x61, 0x80 }, .doom_keycode = KEY_RIGHTARROW },
-  { .tag_id = { 0x04, 0x99, 0x66, 0x63, 0x5F, 0x61, 0x80 }, .doom_keycode = KEY_FIRE },
-  { .tag_id = { 0x04, 0x4D, 0xD6, 0x64, 0x5F, 0x61, 0x80 }, .doom_keycode = 0 },
-  { .tag_id = { 0x04, 0x42, 0xC4, 0x4F, 0x6F, 0x61, 0x80 }, .doom_keycode = KEY_USE },
-  { .tag_id = { 0x04, 0x5B, 0xE1, 0x34, 0x4F, 0x61, 0x80 }, .doom_keycode = KEY_ENTER },
+  { .tag_id = { 0x04, 0x2C, 0x94, 0xE2, 0x85, 0x21, 0x90 }, .doom_keycode = KEY_UPARROW },
+  { .tag_id = { 0x04, 0x7A, 0xE9, 0xE2, 0x85, 0x21, 0x90 }, .doom_keycode = KEY_DOWNARROW },
+  { .tag_id = { 0x04, 0x70, 0x6A, 0xB2, 0x82, 0x21, 0x90 }, .doom_keycode = KEY_LEFTARROW },
+  { .tag_id = { 0x04, 0xB8, 0x12, 0xE2, 0x85, 0x21, 0x90 }, .doom_keycode = KEY_RIGHTARROW },
+  { .tag_id = { 0x04, 0x32, 0x55, 0xB2, 0x82, 0x21, 0x91 }, .doom_keycode = KEY_FIRE },
+  { .tag_id = { 0x04, 0x49, 0x9B, 0xE2, 0x85, 0x21, 0x90 }, .doom_keycode = 0 },
+  { .tag_id = { 0x04, 0x3E, 0x77, 0xE2, 0x85, 0x21, 0x90 }, .doom_keycode = KEY_USE },
+  { .tag_id = { 0x04, 0x10, 0x12, 0xE2, 0x85, 0x21, 0x91 }, .doom_keycode = KEY_ENTER },
   { .is_end = 1 },
 };
 
-#define HEADER_LENGTH (7)
-
 int vanilla_keyboard_mapping = 1;
 
-struct sp_port *nfc_port = NULL;
+// fd for the NFC serial port; -1 means not open / disabled
+int nfc_port = -1;
 
-char current_message[65536 + 4 + 8] = { 0 };
-
-char prev_key = 0;
-
-int offset = 0;
+static char current_message[65536 + 4];
+static int offset = 0;
+int prev_key = 0;
 
 void print_hex(char* buf, size_t n) {
   for (size_t i = 0; i < n; i++) {
@@ -71,133 +70,173 @@ void print_hex(char* buf, size_t n) {
   fprintf(stderr, "\n");
 }
 
-/* Helper function for error handling. */
-int check(enum sp_return result)
-{
-        /* For this example we'll just exit on any error by calling abort(). */
-        char *error_message;
-        switch (result) {
-        case SP_ERR_ARG:
-                printf("Error: Invalid argument.\n");
-                abort();
-        case SP_ERR_FAIL:
-                error_message = sp_last_error_message();
-                printf("Error: Failed: %s\n", error_message);
-                sp_free_error_message(error_message);
-                abort();
-        case SP_ERR_SUPP:
-                printf("Error: Not supported.\n");
-                abort();
-        case SP_ERR_MEM:
-                printf("Error: Couldn't allocate memory.\n");
-                abort();
-        case SP_OK:
-        default:
-                return result;
-        }
+// Non-blocking read wrapper. Returns bytes read, or 0 if no data available.
+static int serial_read(int fd, void *buf, size_t count) {
+  int ret = read(fd, buf, count);
+  if (ret < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+      return 0;
+    fprintf(stderr, "NFC serial read error: %s\n", strerror(errno));
+    return 0;
+  }
+  return ret;
 }
 
-// returns whether we should keep trying to read
-boolean nfc_read(void)
+// Returns true if there may be more data to process.
+static boolean nfc_read(void)
 {
-  static_assert(sizeof(ipp_header) == 7);
-  if (nfc_port == NULL)
+  if (nfc_port < 0)
     return false;
 
+  // --- Read header ---
   if (offset < HEADER_LENGTH) {
-    // fprintf(stderr, "trying to read header\n");
-    int ret = check(sp_nonblocking_read(nfc_port, current_message + offset, HEADER_LENGTH - offset));
+    int ret = serial_read(nfc_port, current_message + offset, HEADER_LENGTH - offset);
     if (ret == 0)
       return false;
-    // fprintf(stderr, "serial: read %d bytes of header\n", ret);
-    // print_hex(current_message + offset, ret);
-    if (current_message[0] != 0xbc) {
-      // fprintf(stderr, "got non-ipp message\n");
-      offset = 0;
-      return true;
-    }
-    offset += ret;
-  }
-  if (offset >= HEADER_LENGTH) {
-    ipp_header head;
 
-    memcpy(&head, current_message, HEADER_LENGTH);
-
-
-    int data_length = (head.data_length_msb << 8) | head.data_length_lsb;
-
-    int full_length = HEADER_LENGTH + data_length;
-
-    int ret = check(sp_nonblocking_read(nfc_port, current_message + offset, full_length - offset));
-    if (ret == 0)
-      return false;
-    // fprintf(stderr, "serial: read %d bytes of data\n", ret);
-    // print_hex(current_message + offset, ret);
-    offset += ret;
-    // fprintf(stderr, "data_length_msb is %02hhx\n", head.data_length_msb);
-    // fprintf(stderr, "data_length_lsb is %02hhx\n", head.data_length_lsb);
-    // fprintf(stderr, "offset is %d\n", offset);
-    // fprintf(stderr, "length is %d\n", full_length);
-
-    if (offset >= full_length) {
-      // fprintf(stderr, "Got ipp message\n");
-      offset = 0;
-      // 0xbe = PICC Read
-      if (head.message_type == 0xbe) {
-        if (data_length != 21) {
-          fprintf(stderr, "dunno how to read length %d", data_length);
-          return true;
-        }
-        char tag_id[7];
-        memcpy(tag_id, current_message + HEADER_LENGTH + 11, 7);
-        fprintf(stderr, "read tag uid ");
-        print_hex(tag_id, 7);
-        for (int i=0; all_tags[i].is_end == 0; i++) {
-          tag_info this_tag = all_tags[i];
-          if (memcmp(this_tag.tag_id, tag_id, 7) == 0) {
-            event_t ev;
-            fprintf(stderr, "found tag with keycode %d\n", (int)this_tag.doom_keycode);
-            if (prev_key != 0) {
-              ev.type = ev_keyup;
-              ev.data1 = prev_key;
-              ev.data2 = 0;
-              D_PostEvent(&ev);
-            }
-            char this_keycode = this_tag.doom_keycode;
-            prev_key = this_keycode;
-            if (this_keycode != 0) {
-              ev.type = ev_keydown;
-              ev.data1 = this_tag.doom_keycode;
-              ev.data2 = 0;
-              D_PostEvent(&ev);
-            }
-            break;
-          }
-        }
+    if (offset == 0) {
+      // Scan forward to the 0xBC magic byte
+      int i = 0;
+      while (i < ret && (unsigned char)current_message[i] != 0xbc)
+        i++;
+      if (i > 0) {
+        memmove(current_message, current_message + i, ret - i);
+        ret -= i;
       }
-      return true;
+      if (ret == 0)
+        return true;
+    }
+    offset += ret;
+    return true;
+  }
+
+  // --- Parse header ---
+  ipp_header head;
+  memcpy(&head, current_message, HEADER_LENGTH);
+  int data_length = (head.data_length_msb << 8) | head.data_length_lsb;
+  // Types >= 0x80 have a 4-byte CRC32 appended after the payload
+  int full_length = HEADER_LENGTH + data_length + (head.message_type >= 0x80 ? 4 : 0);
+
+  // --- Read body ---
+  if (offset < full_length) {
+    int ret = serial_read(nfc_port, current_message + offset, full_length - offset);
+    if (ret == 0)
+      return false;
+    offset += ret;
+    return true;
+  }
+
+  // --- Full packet received ---
+  offset = 0;
+
+  // Discard heartbeats and anything that isn't a card event
+  if (head.message_type != 0xd5)
+    return true;
+
+  unsigned char subcmd = (unsigned char)current_message[HEADER_LENGTH];
+
+  if (subcmd == 0x01) {
+    // Card removed — release whatever key was held
+    if (prev_key != 0) {
+      event_t ev;
+      ev.type = ev_keyup;
+      ev.data1 = prev_key;
+      ev.data2 = 0;
+      D_PostEvent(&ev);
+      prev_key = 0;
+    }
+    return true;
+  }
+
+  if (subcmd != 0x00 || data_length < 9)
+    return true;
+
+  // Card entry: UID is at payload offset +2
+  char tag_id[7];
+  memcpy(tag_id, current_message + HEADER_LENGTH + 2, 7);
+  fprintf(stderr, "card uid: ");
+  print_hex(tag_id, 7);
+
+  int matched = 0;
+  for (int i = 0; all_tags[i].is_end == 0; i++) {
+    if (memcmp(all_tags[i].tag_id, tag_id, 7) == 0) {
+      int this_keycode = (unsigned char)all_tags[i].doom_keycode;
+      fprintf(stderr, "matched keycode %d\n", this_keycode);
+      event_t ev;
+      if (prev_key != 0 && prev_key != this_keycode) {
+        ev.type = ev_keyup;
+        ev.data1 = prev_key;
+        ev.data2 = 0;
+        D_PostEvent(&ev);
+      }
+      prev_key = this_keycode;
+      if (this_keycode != 0) {
+        ev.type = ev_keydown;
+        ev.data1 = this_keycode;
+        ev.data2 = 0;
+        D_PostEvent(&ev);
+      }
+      matched = 1;
+      break;
     }
   }
+  if (!matched)
+    fprintf(stderr, "no uid match\n");
+
   return true;
 }
 
 void I_GetEvent(void)
 {
-  // fprintf(stderr, "I_GetEvent\n");
   while (nfc_read()) {}
 }
 
 void I_InitInput(void)
 {
-  fprintf(stderr, "get port\n");
-  check(sp_get_port_by_name("/dev/ttyS3", &nfc_port));
-  fprintf(stderr, "open port\n");
-  check(sp_open(nfc_port, SP_MODE_READ));
-  fprintf(stderr, "setting stuffs\n");
-  check(sp_set_baudrate(nfc_port, 115200));
-  check(sp_set_bits(nfc_port, 8));
-  check(sp_set_parity(nfc_port, SP_PARITY_NONE));
-  check(sp_set_stopbits(nfc_port, 1));
-  check(sp_set_flowcontrol(nfc_port, SP_FLOWCONTROL_NONE));
-}
+  fprintf(stderr, "opening NFC serial port\n");
 
+  int fd = open("/dev/ttymxc3", O_RDWR | O_NOCTTY | O_NONBLOCK);
+  if (fd < 0) {
+    fprintf(stderr, "Failed to open /dev/ttymxc3: %s — NFC input disabled\n", strerror(errno));
+    nfc_port = -1;
+    return;
+  }
+
+  struct termios tty;
+  if (tcgetattr(fd, &tty) < 0) {
+    fprintf(stderr, "tcgetattr failed: %s — NFC input disabled\n", strerror(errno));
+    close(fd);
+    nfc_port = -1;
+    return;
+  }
+
+  // 115200 baud
+  cfsetispeed(&tty, B115200);
+  cfsetospeed(&tty, B115200);
+
+  // 8N1, no flow control, raw mode
+  tty.c_cflag &= ~PARENB;           // no parity
+  tty.c_cflag &= ~CSTOPB;           // 1 stop bit
+  tty.c_cflag &= ~CSIZE;
+  tty.c_cflag |= CS8;               // 8 data bits
+  tty.c_cflag &= ~CRTSCTS;          // no hardware flow control
+  tty.c_cflag |= CREAD | CLOCAL;    // enable receiver, ignore modem lines
+
+  tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);  // raw input
+  tty.c_iflag &= ~(IXON | IXOFF | IXANY);          // no software flow control
+  tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
+  tty.c_oflag &= ~OPOST;            // raw output
+
+  tty.c_cc[VMIN]  = 0;             // non-blocking: return immediately
+  tty.c_cc[VTIME] = 0;
+
+  if (tcsetattr(fd, TCSANOW, &tty) < 0) {
+    fprintf(stderr, "tcsetattr failed: %s — NFC input disabled\n", strerror(errno));
+    close(fd);
+    nfc_port = -1;
+    return;
+  }
+
+  fprintf(stderr, "NFC serial port ready\n");
+  nfc_port = fd;
+}

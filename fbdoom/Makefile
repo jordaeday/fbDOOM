@@ -17,7 +17,9 @@ endif
 #CFLAGS += -Wunused-const-variable=0 
 #CFLAGS += -fsanitize=address
 OBJS += $(OBJDIR)/i_video_fbdev.o
+ifneq ($(NONFC),1)
 OBJS += $(OBJDIR)/i_input_nfc.o
+endif
 PKG_CONFIG ?= pkg-config
 
 CC ?= $(CROSS_COMPILE)gcc  # gcc or g++
@@ -57,7 +59,7 @@ clean:
 
 $(OUTPUT):	$(OBJS)
 	@echo [Linking $@]
-	$(VB)$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $(OUTPUT) $(LIBS) -Wl,-Map,$(OUTPUT).map
+	$(VB)$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $(OUTPUT) $(LIBS)
 	@echo [Size]
 	-$(CROSS_COMPILE)size $(OUTPUT)
 
